@@ -76,6 +76,78 @@ func TestBoundarySamplerProducesSamplingDecisionsTrueToTheRate(t *testing.T) {
 	}
 }
 
+func TestDynamicSampler(t *testing.T) {
+	if _, err := zipkin.NewDynamicSampler(0.00001, 0); err == nil {
+		t.Fatal("expected error for rate below 0.0001")
+	}
+	if _, err := zipkin.NewDynamicSampler(1.5, 0); err == nil {
+		t.Fatal("expected error for rate above 1")
+	}
+
+	sampler, err := zipkin.NewDynamicSampler(0.1, 42)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+
+	// decisions must match the equivalent static boundary sampler
+	static, _ := zipkin.NewBoundarySampler(0.1, 42)
+	for _, id := range []uint64{0, 1, 123, 999, 0xffffffffffffffff, 0x028f5c28f5c28f5f} {
+		if want, have := static(id), sampler.Sample(id); want != have {
+			t.Fatalf("id %d: want %v, have %v", id, want, have)
+		}
+	}
+
+	// hot update takes effect immediately and stays deterministic
+	if err := sampler.SetRate(0.01); err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	static, _ = zipkin.NewBoundarySampler(0.01, 42)
+	for _, id := range []uint64{0, 1, 123, 999, 0xffffffffffffffff, 0x028f5c28f5c28f5f} {
+		if want, have := static(id), sampler.Sample(id); want != have {
+			t.Errorf("id %d after SetRate: want %v, have %v", id, want, have)
+		}
+	}
+
+	if err := sampler.SetRate(2.0); err == nil {
+		t.Error("expected error for invalid rate, have nil")
+	}
+	if want, have := 0.01, sampler.Rate(); want != have {
+		t.Errorf("rate after rejected SetRate: want %f, have %f", want, have)
+	}
+
+	if err := sampler.SetRate(0.0); err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	if sampler.Sample(0) {
+		t.Error("rate 0.0 should never sample")
+	}
+	if err := sampler.SetRate(1.0); err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	if !sampler.Sample(0xffffffffffffffff) {
+		t.Error("rate 1.0 should always sample")
+	}
+}
+
+func TestDynamicSamplerConcurrentUpdate(t *testing.T) {
+	sampler, err := zipkin.NewDynamicSampler(0.5, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %+v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = sampler.SetRate(float64(i%100) / 100)
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		sampler.Sample(rand.Uint64())
+		_ = sampler.Rate()
+	}
+	<-done
+}
+
 func TestCountingSampler(t *testing.T) {
 	{
 		_, have := zipkin.NewCountingSampler(0.009)

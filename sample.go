@@ -19,6 +19,7 @@ import (
 	"math"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -50,14 +51,14 @@ func NewModuloSampler(mod uint64) Sampler {
 // provision random trace ids, and make the sampling decision only once.
 // It defends against nodes in the cluster selecting exactly the same ids.
 func NewBoundarySampler(rate float64, salt int64) (Sampler, error) {
+	if err := validateBoundaryRate(rate); err != nil {
+		return nil, err
+	}
 	if rate == 0.0 {
 		return NeverSample, nil
 	}
 	if rate == 1.0 {
 		return AlwaysSample, nil
-	}
-	if rate < 0.0001 || rate > 1 {
-		return nil, fmt.Errorf("rate should be 0.0 or between 0.0001 and 1: was %f", rate)
 	}
 
 	var (
@@ -71,6 +72,68 @@ func NewBoundarySampler(rate float64, salt int64) (Sampler, error) {
 		//   right shift ensures uniform distribution across [0, 2^63)
 		return ((id ^ usalt) >> 1) < boundary
 	}, nil
+}
+
+func validateBoundaryRate(rate float64) error {
+	if rate != 0.0 && rate != 1.0 && (rate < 0.0001 || rate > 1) {
+		return fmt.Errorf("rate should be 0.0 or between 0.0001 and 1: was %f", rate)
+	}
+	return nil
+}
+
+// DynamicSampler is a boundary Sampler whose rate can be updated at runtime.
+// The sampling decision stays deterministic per trace id for a given rate, so
+// all instances holding the same rate and salt make identical decisions for
+// the same trace. Typical usage is to create one DynamicSampler at startup,
+// hand its Sample method to WithSampler, and call SetRate from a config
+// center watch callback or a background polling goroutine. Reading the
+// current rate on the request path is a single atomic load.
+type DynamicSampler struct {
+	salt     uint64
+	boundary atomic.Uint64
+}
+
+// NewDynamicSampler returns a DynamicSampler initialized with the given rate
+// and salt. The salt must be identical across all instances for cluster-wide
+// consistent sampling decisions.
+func NewDynamicSampler(rate float64, salt int64) (*DynamicSampler, error) {
+	if err := validateBoundaryRate(rate); err != nil {
+		return nil, err
+	}
+	s := &DynamicSampler{salt: uint64(salt)}
+	s.boundary.Store(boundaryForRate(rate))
+	return s, nil
+}
+
+// SetRate updates the sampling rate. It is safe for concurrent use with
+// in-flight sampling decisions.
+func (s *DynamicSampler) SetRate(rate float64) error {
+	if err := validateBoundaryRate(rate); err != nil {
+		return err
+	}
+	s.boundary.Store(boundaryForRate(rate))
+	return nil
+}
+
+// Rate returns the currently effective sampling rate.
+func (s *DynamicSampler) Rate() float64 {
+	return float64(s.boundary.Load()) / (1 << 63)
+}
+
+// Sample implements the Sampler function signature and can be passed
+// directly to WithSampler.
+func (s *DynamicSampler) Sample(id uint64) bool {
+	return ((id ^ s.salt) >> 1) < s.boundary.Load()
+}
+
+func boundaryForRate(rate float64) uint64 {
+	if rate <= 0.0 {
+		return 0
+	}
+	if rate >= 1.0 {
+		return 1 << 63
+	}
+	return uint64(rate * (1 << 63))
 }
 
 // NewCountingSampler is appropriate for low-traffic instrumentation or
