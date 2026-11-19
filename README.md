@@ -46,6 +46,17 @@ The propagation package and B3 subpackage hold the logic for propagating
 SpanContext (span identifiers and sampling flags) between services participating
 in traces. Currently Zipkin B3 Propagation is supported for HTTP and GRPC.
 
+### async
+The async package carries the tracing context across goroutines and reused
+worker pools. Context is captured on the submitting goroutine into an immutable
+snapshot and restored inside each task, so reused workers never leak one
+request's context into another. `Instrumenter` wraps existing
+`func(context.Context)` callbacks without changing their signatures and opens a
+child span for the asynchronous work; `Pool` provides a bounded, reusable worker
+pool with per-task context isolation; `Batch` fans sub-tasks out under a single
+parent span so each sub-task stays part of the same trace tree instead of
+becoming an independent root.
+
 ### middleware
 The middleware subpackages contain officially supported middleware handlers and
 tracing wrappers.
