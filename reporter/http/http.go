@@ -47,6 +47,7 @@ type HTTPDoer interface { // nolint: revive // keep as is, we don't want to brea
 type httpReporter struct {
 	url           string
 	client        HTTPDoer
+	resolverTTL   time.Duration
 	logger        *log.Logger
 	batchInterval time.Duration
 	batchSize     int
@@ -60,6 +61,10 @@ type httpReporter struct {
 	reqCallback   RequestCallbackFn
 	reqTimeout    time.Duration
 	serializer    reporter.SpanSerializer
+	// Test hooks: when set they replace the default system DNS lookup and
+	// network dial used by the resolving transport.
+	lookupFn lookupIPFn
+	dialFn   dialContextFn
 }
 
 // Send implements reporter
@@ -215,6 +220,15 @@ func BatchInterval(d time.Duration) ReporterOption {
 	return func(r *httpReporter) { r.batchInterval = d }
 }
 
+// ResolverTTL sets how long the resolved collector address is cached before
+// the host name is resolved again. A positive value bounds how long the
+// reporter keeps sending to a stale IP after the DNS record changes; the
+// default (when set to 0) is 5 minutes. A negative value disables the
+// in-process cache and resolves on every report batch.
+func ResolverTTL(d time.Duration) ReporterOption {
+	return func(r *httpReporter) { r.resolverTTL = d }
+}
+
 // Client sets a custom http client to use under the interface HTTPDoer
 // which includes a `Do` method with same signature as the *http.Client
 func Client(client HTTPDoer) ReporterOption {
@@ -250,7 +264,6 @@ func NewReporter(url string, opts ...ReporterOption) reporter.Reporter {
 	r := httpReporter{
 		url:           url,
 		logger:        log.New(os.Stderr, "", log.LstdFlags),
-		client:        &http.Client{},
 		batchInterval: defaultBatchInterval,
 		batchSize:     defaultBatchSize,
 		maxBacklog:    defaultMaxBacklog,
@@ -262,14 +275,46 @@ func NewReporter(url string, opts ...ReporterOption) reporter.Reporter {
 		batchMtx:      &sync.Mutex{},
 		serializer:    reporter.JSONSerializer{},
 		reqTimeout:    defaultTimeout,
+		resolverTTL:   defaultResolverTTL,
 	}
 
 	for _, opt := range opts {
 		opt(&r)
 	}
 
+	if r.resolverTTL == 0 {
+		r.resolverTTL = defaultResolverTTL
+	}
+
+	if r.client == nil {
+		// No custom client provided: use a transport whose in-process DNS
+		// cache expires on a TTL so a changed collector address is picked up
+		// without restarting the process.
+		transport, err := newResolvingTransport(r.url, r.resolverTTL, r.lookupFn, r.dialFn, r.logger)
+		if err != nil {
+			r.logger.Printf("failed to build resolving transport, using default client: %s\n", err.Error())
+		}
+		if transport != nil {
+			r.client = &http.Client{Transport: transport}
+		} else {
+			r.client = &http.Client{}
+		}
+	}
+
 	go r.loop()
 	go r.sendLoop()
 
 	return &r
+}
+
+// withLookupFn overrides the DNS lookup function used by the resolving
+// transport. It is intended for in-package tests only.
+func withLookupFn(fn lookupIPFn) ReporterOption {
+	return func(r *httpReporter) { r.lookupFn = fn }
+}
+
+// withDialFn overrides the network dial function used by the resolving
+// transport. It is intended for in-package tests only.
+func withDialFn(fn dialContextFn) ReporterOption {
+	return func(r *httpReporter) { r.dialFn = fn }
 }
