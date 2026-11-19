@@ -17,10 +17,13 @@ package http_test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -226,6 +229,250 @@ func TestB3SamplingHeader(t *testing.T) {
 	if want, have := []string{"0"}, haveHeaders["B3"]; !reflect.DeepEqual(want, have) {
 		t.Errorf("B3 header: want: %v, have %v", want, have)
 	}
+}
+
+func TestBacklogKeepsTraceStructure(t *testing.T) {
+	var (
+		mtx  sync.Mutex
+		got  []*model.SpanModel
+		seen = make(chan struct{}, 1)
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		var spans []*model.SpanModel
+		if err := json.NewDecoder(r.Body).Decode(&spans); err != nil {
+			t.Errorf("failed to decode spans: %v", err)
+			return
+		}
+		mtx.Lock()
+		got = append(got, spans...)
+		mtx.Unlock()
+		select {
+		case seen <- struct{}{}:
+		default:
+		}
+	}))
+	defer ts.Close()
+
+	rep := zipkinhttp.NewReporter(
+		ts.URL,
+		zipkinhttp.BatchInterval(time.Hour),
+		zipkinhttp.MaxBacklog(2),
+		zipkinhttp.Logger(log.New(io.Discard, "", 0)),
+	)
+
+	traceIDs := []model.TraceID{{Low: 1}, {Low: 2}, {Low: 3}, {Low: 4}}
+	for i, traceID := range traceIDs {
+		parentID := model.ID(i*2 + 1)
+		childID := model.ID(i*2 + 2)
+		rep.Send(model.SpanModel{
+			SpanContext: model.SpanContext{
+				TraceID: traceID,
+				ID:      parentID,
+			},
+			Kind:      model.Server,
+			Timestamp: time.Now(),
+			Tags:      map[string]string{"detail": "parent"},
+		})
+		rep.Send(model.SpanModel{
+			SpanContext: model.SpanContext{
+				TraceID:  traceID,
+				ID:       childID,
+				ParentID: &parentID,
+			},
+			Kind:      model.Client,
+			Timestamp: time.Now(),
+			Annotations: []model.Annotation{
+				{Timestamp: time.Now(), Value: "child detail"},
+			},
+		})
+	}
+	rep.Close()
+
+	<-seen
+	mtx.Lock()
+	reported := append([]*model.SpanModel(nil), got...)
+	mtx.Unlock()
+
+	byTrace := groupSpansByTrace(reported)
+	for _, traceID := range traceIDs {
+		spans := byTrace[traceID]
+		if len(spans) != 2 {
+			t.Fatalf("trace %s has %d spans, want 2", traceID, len(spans))
+		}
+		ids := map[model.ID]bool{}
+		for _, span := range spans {
+			ids[span.ID] = true
+		}
+		for _, span := range spans {
+			if span.ParentID != nil && !ids[*span.ParentID] {
+				t.Fatalf("trace %s has dangling parent %s", traceID, *span.ParentID)
+			}
+		}
+	}
+}
+
+func TestBacklogDropsWholeTracesOnly(t *testing.T) {
+	var (
+		mtx sync.Mutex
+		got []*model.SpanModel
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		var spans []*model.SpanModel
+		if err := json.NewDecoder(r.Body).Decode(&spans); err != nil {
+			t.Errorf("failed to decode spans: %v", err)
+			return
+		}
+		mtx.Lock()
+		got = append(got, spans...)
+		mtx.Unlock()
+	}))
+	defer ts.Close()
+
+	rep := zipkinhttp.NewReporter(
+		ts.URL,
+		zipkinhttp.BatchInterval(time.Hour),
+		zipkinhttp.MaxBacklog(1),
+		zipkinhttp.Logger(log.New(io.Discard, "", 0)),
+	)
+
+	const traceCount = 12
+	for i := 0; i < traceCount; i++ {
+		traceID := model.TraceID{Low: uint64(i + 1)}
+		parentID := model.ID(i*2 + 1)
+		childID := model.ID(i*2 + 2)
+		rep.Send(model.SpanModel{
+			SpanContext: model.SpanContext{TraceID: traceID, ID: parentID},
+			Timestamp:   time.Now(),
+		})
+		rep.Send(model.SpanModel{
+			SpanContext: model.SpanContext{
+				TraceID:  traceID,
+				ID:       childID,
+				ParentID: &parentID,
+			},
+			Timestamp: time.Now(),
+		})
+	}
+
+	// The oldest trace must already be tombstoned. This late span must not be
+	// reported on its own and create an orphan.
+	lateTraceID := model.TraceID{Low: 1}
+	rep.Send(model.SpanModel{
+		SpanContext: model.SpanContext{TraceID: lateTraceID, ID: 1000},
+		Timestamp:   time.Now(),
+	})
+	rep.Close()
+
+	mtx.Lock()
+	reported := append([]*model.SpanModel(nil), got...)
+	mtx.Unlock()
+
+	byTrace := groupSpansByTrace(reported)
+	complete := 0
+	dropped := 0
+	for i := 0; i < traceCount; i++ {
+		traceID := model.TraceID{Low: uint64(i + 1)}
+		switch len(byTrace[traceID]) {
+		case 0:
+			dropped++
+		case 2:
+			complete++
+		default:
+			t.Fatalf("trace %s was partially reported: %d spans", traceID, len(byTrace[traceID]))
+		}
+	}
+	if dropped == 0 {
+		t.Fatal("expected at least one whole trace to be dropped")
+	}
+	if complete == 0 {
+		t.Fatal("expected at least one whole trace to be reported")
+	}
+	if len(byTrace[lateTraceID]) != 0 {
+		t.Fatalf("late span for dropped trace was reported: %d spans", len(byTrace[lateTraceID]))
+	}
+}
+
+func TestSendDoesNotBlockOnCollector(t *testing.T) {
+	client := &blockingClient{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	rep := zipkinhttp.NewReporter(
+		"http://collector.invalid/api/v2/spans",
+		zipkinhttp.BatchInterval(time.Hour),
+		zipkinhttp.BatchSize(1),
+		zipkinhttp.MaxBacklog(1),
+		zipkinhttp.Client(client),
+		zipkinhttp.Logger(log.New(io.Discard, "", 0)),
+	)
+
+	traceID := model.TraceID{Low: 1}
+	rep.Send(model.SpanModel{
+		SpanContext: model.SpanContext{TraceID: traceID, ID: 1},
+		Timestamp:   time.Now(),
+	})
+
+	select {
+	case <-client.started:
+	case <-time.After(2 * time.Second):
+		close(client.release)
+		t.Fatal("reporter did not start network send")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			id := model.ID(i + 2)
+			rep.Send(model.SpanModel{
+				SpanContext: model.SpanContext{TraceID: traceID, ID: id, ParentID: idPtr(1)},
+				Timestamp:   time.Now(),
+			})
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		close(client.release)
+		t.Fatal("Send blocked while the collector was slow")
+	}
+
+	close(client.release)
+	if err := rep.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+}
+
+type blockingClient struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingClient) Do(req *http.Request) (*http.Response, error) {
+	c.once.Do(func() { close(c.started) })
+	select {
+	case <-c.release:
+	case <-req.Context().Done():
+		return nil, req.Context().Err()
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       ioutil.NopCloser(bytes.NewReader(nil)),
+	}, nil
+}
+
+func groupSpansByTrace(spans []*model.SpanModel) map[model.TraceID][]*model.SpanModel {
+	byTrace := make(map[model.TraceID][]*model.SpanModel)
+	for _, span := range spans {
+		byTrace[span.TraceID] = append(byTrace[span.TraceID], span)
+	}
+	return byTrace
+}
+
+func idPtr(id model.ID) *model.ID {
+	return &id
 }
 
 type headerClient struct {

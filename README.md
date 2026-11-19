@@ -106,6 +106,10 @@ Most common Reporter type used by Zipkin users transporting Spans to the Zipkin
 server using JSON over HTTP. The reporter holds a buffer and reports to the
 backend asynchronously.
 
+When the buffer is under pressure, spans are reduced to structural skeletons
+per trace instead of being dropped individually, keeping parent/child links
+intact. If the compact buffer also fills, complete traces are dropped.
+
 #### Kafka Reporter
 High performance Reporter transporting Spans to the Zipkin server using a Kafka
 Producer digesting JSON V2 Spans. The reporter uses the
