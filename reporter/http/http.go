@@ -20,6 +20,7 @@ package http
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -105,7 +106,22 @@ func (r *httpReporter) sendLoop() {
 	for range r.sendC {
 		_ = r.sendBatch()
 	}
-	r.shutdown <- r.sendBatch()
+	// On shutdown keep retrying until the backlog is flushed, otherwise spans
+	// belonging to a failed batch would be lost and traces could be reported
+	// partially.
+	for {
+		if err := r.sendBatch(); err != nil {
+			r.shutdown <- err
+			return
+		}
+		r.batchMtx.Lock()
+		pending := len(r.batch)
+		r.batchMtx.Unlock()
+		if pending == 0 {
+			r.shutdown <- nil
+			return
+		}
+	}
 }
 
 func (r *httpReporter) enqueueSend() {
@@ -132,9 +148,11 @@ func (r *httpReporter) append(span *model.SpanModel) (newBatchSize int) {
 }
 
 func (r *httpReporter) sendBatch() error {
-	// Select all current spans in the batch to be sent
+	// Select the spans to be sent. The selection is trace-aware: a trace is
+	// never split across two batches so that a failed batch can be retried as
+	// a whole without leaving the server with a partial trace.
 	r.batchMtx.Lock()
-	sendBatch := r.batch[:]
+	sendBatch := r.batch[:r.traceSafePrefixLen(r.batch)]
 	r.batchMtx.Unlock()
 
 	if len(sendBatch) == 0 {
@@ -174,14 +192,79 @@ func (r *httpReporter) sendBatch() error {
 	_ = resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		r.logger.Printf("failed the request with status code %d\n", resp.StatusCode)
+		// Keep the spans in the batch so they are retried. Removing them here
+		// would lose the batch and leave the affected traces incomplete.
+		return fmt.Errorf("failed the request with status code %d", resp.StatusCode)
 	}
 
-	// Remove sent spans from the batch even if they were not saved
+	// Only remove the spans once the collector acknowledged them. On failure
+	// they stay buffered and are retried as part of the next batch, so the
+	// same span is never handed to the collector twice after a success.
 	r.batchMtx.Lock()
-	r.batch = r.batch[len(sendBatch):]
+	r.batch = r.removeSent(r.batch, sendBatch)
 	r.batchMtx.Unlock()
 
 	return nil
+}
+
+// traceSafePrefixLen returns the length of the longest prefix of spans that
+// can be sent without splitting a trace across two batches.
+//
+// The prefix contains at least one span and, unless a single trace exceeds the
+// configured batch size, at most batchSize spans. A trace larger than the
+// batch size is still kept together: the total backlog remains bounded by
+// MaxBacklog, so batch sizes can never grow out of control.
+func (r *httpReporter) traceSafePrefixLen(spans []*model.SpanModel) int {
+	limit := r.batchSize
+	if limit < 1 {
+		limit = len(spans)
+	}
+	if len(spans) <= limit {
+		return len(spans)
+	}
+
+	// Traces may appear in non-contiguous sections of the backlog (for example
+	// when spans from other traces arrive in between) and can repeat. Count
+	// the spans per trace inside the first limit entries and extend the
+	// prefix until every one of those traces has fully entered it.
+	open := make(map[model.TraceID]int)
+	for i, span := range spans {
+		if i < limit {
+			open[span.TraceID]++
+			continue
+		}
+		remaining, ok := open[span.TraceID]
+		if !ok {
+			return i
+		}
+		if remaining == 1 {
+			delete(open, span.TraceID)
+			if len(open) == 0 {
+				return i + 1
+			}
+			continue
+		}
+		open[span.TraceID] = remaining - 1
+	}
+	return len(spans)
+}
+
+// removeSent filters the sent spans out of the backlog by identity rather than
+// by index. Newly appended spans, and spans disposed while the request was in
+// flight, must not be dropped or confused with the ones that were sent.
+func (r *httpReporter) removeSent(backlog, sent []*model.SpanModel) []*model.SpanModel {
+	sentSet := make(map[*model.SpanModel]struct{}, len(sent))
+	for _, span := range sent {
+		sentSet[span] = struct{}{}
+	}
+	kept := backlog[:0]
+	for _, span := range backlog {
+		if _, ok := sentSet[span]; ok {
+			continue
+		}
+		kept = append(kept, span)
+	}
+	return kept
 }
 
 // RequestCallbackFn receives the initialized request from the Collector before
@@ -198,7 +281,9 @@ func Timeout(duration time.Duration) ReporterOption {
 }
 
 // BatchSize sets the maximum batch size, after which a collect will be
-// triggered. The default batch size is 100 traces.
+// triggered. The default batch size is 100 spans. A trace is never split
+// across batches, so a batch containing a trace larger than this size can
+// exceed it; the total buffered size is still bounded by MaxBacklog.
 func BatchSize(n int) ReporterOption {
 	return func(r *httpReporter) { r.batchSize = n }
 }
