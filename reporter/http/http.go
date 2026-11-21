@@ -60,6 +60,14 @@ type httpReporter struct {
 	reqCallback   RequestCallbackFn
 	reqTimeout    time.Duration
 	serializer    reporter.SpanSerializer
+	// droppedTraceIDs holds the traces that lost at least one span to
+	// backlog disposal. Once a trace is in this set every further span
+	// belonging to it is refused as well, so the collector never receives
+	// a partially reported trace (e.g. a parent whose children were dropped).
+	// It only grows while the backlog is overflowing, which by itself means
+	// the collector is under severe backpressure, so its size stays bounded
+	// by the number of distinct traces involved in the overflow.
+	droppedTraceIDs map[model.TraceID]struct{}
 }
 
 // Send implements reporter
@@ -119,11 +127,38 @@ func (r *httpReporter) enqueueSend() {
 func (r *httpReporter) append(span *model.SpanModel) (newBatchSize int) {
 	r.batchMtx.Lock()
 
+	// A span from a trace we already started dropping can never be reported
+	// as part of a whole trace, so refuse it immediately.
+	if _, dropped := r.droppedTraceIDs[span.TraceID]; dropped {
+		r.batchMtx.Unlock()
+		return len(r.batch)
+	}
+
 	r.batch = append(r.batch, span)
 	if len(r.batch) > r.maxBacklog {
 		dispose := len(r.batch) - r.maxBacklog
-		r.logger.Printf("backlog too long, disposing %d spans", dispose)
-		r.batch = r.batch[dispose:]
+		// Spans belonging to the same trace must never be disposed
+		// individually, otherwise the collector receives partial traces
+		// that look like downstream reporting failures. Mark the trace IDs
+		// cut from the front as dropped, remove every span of those traces
+		// currently in the backlog (including spans that arrived earlier),
+		// and remember the IDs so later arrivals are refused too.
+		disposedTraces := make(map[model.TraceID]struct{}, dispose)
+		for _, disposedSpan := range r.batch[:dispose] {
+			disposedTraces[disposedSpan.TraceID] = struct{}{}
+		}
+		kept := r.batch[:0]
+		for _, backlogSpan := range r.batch {
+			if _, drop := disposedTraces[backlogSpan.TraceID]; drop {
+				continue
+			}
+			kept = append(kept, backlogSpan)
+		}
+		r.batch = kept
+		for traceID := range disposedTraces {
+			r.droppedTraceIDs[traceID] = struct{}{}
+		}
+		r.logger.Printf("backlog too long, disposing %d spans from %d traces", dispose, len(disposedTraces))
 	}
 	newBatchSize = len(r.batch)
 
@@ -204,7 +239,11 @@ func BatchSize(n int) ReporterOption {
 }
 
 // MaxBacklog sets the maximum backlog size. When batch size reaches this
-// threshold, spans from the beginning of the batch will be disposed.
+// threshold, spans from the beginning of the batch will be disposed. Disposal
+// is trace-atomic: every span sharing a trace ID with a disposed span is
+// dropped as well, so the collector never receives a partially reported
+// trace. The hot path is unchanged while the backlog fits, so the extra
+// bookkeeping only happens once the backlog overflows.
 func MaxBacklog(n int) ReporterOption {
 	return func(r *httpReporter) { r.maxBacklog = n }
 }
@@ -248,20 +287,21 @@ func Serializer(serializer reporter.SpanSerializer) ReporterOption {
 // http://localhost:9411/api/v2/spans
 func NewReporter(url string, opts ...ReporterOption) reporter.Reporter {
 	r := httpReporter{
-		url:           url,
-		logger:        log.New(os.Stderr, "", log.LstdFlags),
-		client:        &http.Client{},
-		batchInterval: defaultBatchInterval,
-		batchSize:     defaultBatchSize,
-		maxBacklog:    defaultMaxBacklog,
-		batch:         []*model.SpanModel{},
-		spanC:         make(chan *model.SpanModel),
-		sendC:         make(chan struct{}, 1),
-		quit:          make(chan struct{}, 1),
-		shutdown:      make(chan error, 1),
-		batchMtx:      &sync.Mutex{},
-		serializer:    reporter.JSONSerializer{},
-		reqTimeout:    defaultTimeout,
+		url:             url,
+		logger:          log.New(os.Stderr, "", log.LstdFlags),
+		client:          &http.Client{},
+		batchInterval:   defaultBatchInterval,
+		batchSize:       defaultBatchSize,
+		maxBacklog:      defaultMaxBacklog,
+		batch:           []*model.SpanModel{},
+		spanC:           make(chan *model.SpanModel),
+		sendC:           make(chan struct{}, 1),
+		quit:            make(chan struct{}, 1),
+		shutdown:        make(chan error, 1),
+		batchMtx:        &sync.Mutex{},
+		droppedTraceIDs: map[model.TraceID]struct{}{},
+		serializer:      reporter.JSONSerializer{},
+		reqTimeout:      defaultTimeout,
 	}
 
 	for _, opt := range opts {

@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -240,4 +241,148 @@ func (h headerClient) Do(req *http.Request) (*http.Response, error) {
 		}
 	}
 	return h.client.Do(req)
+}
+
+func generateTraceSpans(traceID model.TraceID, spanCount int) []*model.SpanModel {
+	idGen := idgenerator.NewRandom64()
+	spans := make([]*model.SpanModel, spanCount)
+	for i := 0; i < spanCount; i++ {
+		spans[i] = &model.SpanModel{
+			SpanContext: model.SpanContext{
+				TraceID: traceID,
+				ID:      idGen.SpanID(traceID),
+			},
+			Name:      "name",
+			Kind:      model.Client,
+			Timestamp: time.Now(),
+		}
+	}
+	return spans
+}
+
+func collectReceivedSpans(t *testing.T) (string, func() []*model.SpanModel) {
+	t.Helper()
+
+	var (
+		mtx       sync.Mutex
+		collected []*model.SpanModel
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		payload, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		var batch []*model.SpanModel
+		if err := json.Unmarshal(payload, &batch); err != nil {
+			t.Errorf("failed to parse json payload: %v", err)
+		}
+		mtx.Lock()
+		collected = append(collected, batch...)
+		mtx.Unlock()
+	}))
+	t.Cleanup(ts.Close)
+
+	return ts.URL, func() []*model.SpanModel {
+		mtx.Lock()
+		defer mtx.Unlock()
+		return collected
+	}
+}
+
+func countPartialTraces(spans []*model.SpanModel, expectedPerTrace map[model.TraceID]int) (partial int) {
+	receivedPerTrace := make(map[model.TraceID]int, len(expectedPerTrace))
+	for _, span := range spans {
+		receivedPerTrace[span.TraceID]++
+	}
+	for traceID, expected := range expectedPerTrace {
+		if have := receivedPerTrace[traceID]; have > 0 && have != expected {
+			partial++
+		}
+	}
+	return partial
+}
+
+func TestBacklogDisposalKeepsTracesWhole(t *testing.T) {
+	const (
+		maxBacklog = 20
+		traces     = 10
+		spanPerTr  = 3
+	)
+
+	idGen := idgenerator.NewRandom64()
+	traceIDs := make([]model.TraceID, traces)
+	expected := make(map[model.TraceID]int, traces)
+	var interleaved []*model.SpanModel
+	for i := range traceIDs {
+		traceIDs[i] = idGen.TraceID()
+		expected[traceIDs[i]] = spanPerTr
+	}
+	// interleave spans so a positional cut from the front lands inside
+	// multiple traces instead of on a trace boundary
+	for spanIdx := 0; spanIdx < spanPerTr; spanIdx++ {
+		for _, traceID := range traceIDs {
+			interleaved = append(interleaved, generateTraceSpans(traceID, 1)...)
+		}
+	}
+
+	url, received := collectReceivedSpans(t)
+	rep := zipkinhttp.NewReporter(
+		url,
+		zipkinhttp.MaxBacklog(maxBacklog),
+		zipkinhttp.BatchSize(len(interleaved)+1),
+	)
+
+	for _, span := range interleaved {
+		rep.Send(*span)
+	}
+	if err := rep.Close(); err != nil {
+		t.Fatalf("unexpected error closing reporter: %v", err)
+	}
+
+	got := received()
+	if partial := countPartialTraces(got, expected); partial != 0 {
+		t.Fatalf("found %d partially reported traces among %d received spans", partial, len(got))
+	}
+	if len(got) > maxBacklog {
+		t.Fatalf("backlog not bounded: received %d spans, maxBacklog %d", len(got), maxBacklog)
+	}
+}
+
+func TestBacklogUnderLimitIsNotSlowedOrDropped(t *testing.T) {
+	const (
+		maxBacklog = 100
+		traces     = 10
+		spanPerTr  = 3
+	)
+
+	idGen := idgenerator.NewRandom64()
+	expected := make(map[model.TraceID]int, traces)
+	var spans []*model.SpanModel
+	for i := 0; i < traces; i++ {
+		traceID := idGen.TraceID()
+		expected[traceID] = spanPerTr
+		spans = append(spans, generateTraceSpans(traceID, spanPerTr)...)
+	}
+
+	url, received := collectReceivedSpans(t)
+	rep := zipkinhttp.NewReporter(
+		url,
+		zipkinhttp.MaxBacklog(maxBacklog),
+		zipkinhttp.BatchSize(len(spans)+1),
+	)
+
+	for _, span := range spans {
+		rep.Send(*span)
+	}
+	if err := rep.Close(); err != nil {
+		t.Fatalf("unexpected error closing reporter: %v", err)
+	}
+
+	got := received()
+	if len(got) != len(spans) {
+		t.Fatalf("spans lost without overflow: received %d, want %d", len(got), len(spans))
+	}
+	if partial := countPartialTraces(got, expected); partial != 0 {
+		t.Fatalf("found %d partially reported traces", partial)
+	}
 }
