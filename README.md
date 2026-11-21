@@ -115,6 +115,34 @@ underneath.
 ## Usage and Examples
 [HTTP Server Example](examples/httpserver_test.go)
 
+## Span lifecycle on error paths
+
+A span must be finished to be reported and released. If a call panics or
+returns through an error path without calling `Finish`, the span is neither
+reported (producing a headless trace) nor garbage collected, so repeated
+failures accumulate spans in memory until the process is killed.
+
+Two complementary mechanisms keep the span lifecycle correct:
+
+- `zipkin.FinishOnRecover` is a deferred guard that finishes and tags the
+  span when a panic unwinds the stack, then re-raises the panic. On a normal
+  return it does nothing, leaving the explicit `Finish` on the success path
+  untouched:
+
+  ```go
+  sp := tracer.StartSpan("work")
+  defer zipkin.FinishOnRecover(sp)
+  // ... success path calls sp.Finish() as usual
+  ```
+
+- `WithSpanReaper(ttl)` enables a tracer-wide safety net. Started spans are
+  tracked while active and automatically finished once they outlive the TTL,
+  covering callers that forget any deferred finish. A span that finishes
+  normally unregisters itself before the TTL and is never reaped, so spans
+  still in use are never reclaimed early. The reaper is opt-in; without it
+  the `StartSpan`/`Finish` hot path keeps its original overhead. Call
+  `tracer.Close()` to stop the reaper goroutine.
+
 ## Go Support Policy
 
 zipkin-go follows the same version policy as Go's [Release Policy](https://go.dev/doc/devel/release):

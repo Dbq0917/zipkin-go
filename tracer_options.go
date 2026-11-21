@@ -16,6 +16,7 @@ package zipkin
 
 import (
 	"errors"
+	"time"
 
 	"github.com/openzipkin/zipkin-go/idgenerator"
 	"github.com/openzipkin/zipkin-go/model"
@@ -133,6 +134,27 @@ func WithNoopTracer(tracerNoop bool) TracerOption {
 		} else {
 			o.noop = 0
 		}
+		return nil
+	}
+}
+
+// WithSpanReaper enables a background reaper that finishes spans which were
+// never finished by their caller after ttl has elapsed. This is a safety net
+// for error paths (panics, early returns, aborted goroutines) that forget to
+// call Span.Finish: without it those spans stay referenced for the lifetime
+// of the process and are never reported, producing headless traces and
+// unbounded memory growth.
+//
+// The reaper only touches spans still tracked as active: a span that finishes
+// normally unregisters itself before the TTL and is never reaped, so spans in
+// active use are never reclaimed early. When the reaper is not enabled (the
+// default) StartSpan and Finish keep their original behavior and overhead.
+func WithSpanReaper(ttl time.Duration) TracerOption {
+	return func(o *Tracer) error {
+		if ttl <= 0 {
+			return ErrInvalidSpanReaperTTL
+		}
+		o.reaper = newSpanReaper(ttl)
 		return nil
 	}
 }

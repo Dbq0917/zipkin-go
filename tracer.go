@@ -16,6 +16,7 @@ package zipkin
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +38,8 @@ type Tracer struct {
 	noop                 int32 // used as atomic bool (1 = true, 0 = false)
 	sharedSpans          bool
 	unsampledNoop        bool
+	reaper               *spanReaper
+	closeOnce            sync.Once
 }
 
 // NewTracer returns a new Zipkin Tracer.
@@ -67,7 +70,23 @@ func NewTracer(rep reporter.Reporter, opts ...TracerOption) (*Tracer, error) {
 		}
 	}
 
+	if t.reaper != nil {
+		go t.reaper.loop()
+	}
+
 	return t, nil
+}
+
+// Close releases the background resources held by the Tracer. Currently this
+// only stops the span reaper enabled through WithSpanReaper; it is safe to
+// call when the reaper is not enabled. The Reporter is not closed, as its
+// lifecycle is owned by the caller.
+func (t *Tracer) Close() {
+	t.closeOnce.Do(func() {
+		if t.reaper != nil {
+			t.reaper.close()
+		}
+	})
 }
 
 // StartSpanFromContext creates and starts a span using the span found in
@@ -160,6 +179,12 @@ func (t *Tracer) StartSpan(name string, options ...SpanOption) Span {
 	// add start time
 	if s.Timestamp.IsZero() {
 		s.Timestamp = time.Now()
+	}
+
+	if s.mustCollect == 1 && t.reaper != nil {
+		// only spans that can be reported need lifecycle tracking; spans
+		// finished before the reaper TTL are removed again by Finish.
+		t.reaper.register(s)
 	}
 
 	return s

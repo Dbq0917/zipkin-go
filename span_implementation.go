@@ -78,6 +78,9 @@ func (s *spanImpl) Tag(key, value string) {
 
 func (s *spanImpl) Finish() {
 	if atomic.CompareAndSwapInt32(&s.mustCollect, 1, 0) {
+		if s.tracer.reaper != nil {
+			s.tracer.reaper.unregister(s)
+		}
 		s.Duration = time.Since(s.Timestamp)
 		if s.flushOnFinish {
 			s.mtx.RLock()
@@ -89,6 +92,9 @@ func (s *spanImpl) Finish() {
 
 func (s *spanImpl) FinishedWithDuration(d time.Duration) {
 	if atomic.CompareAndSwapInt32(&s.mustCollect, 1, 0) {
+		if s.tracer.reaper != nil {
+			s.tracer.reaper.unregister(s)
+		}
 		s.Duration = d
 		if s.flushOnFinish {
 			s.mtx.RLock()
