@@ -132,9 +132,14 @@ func (r *httpReporter) append(span *model.SpanModel) (newBatchSize int) {
 }
 
 func (r *httpReporter) sendBatch() error {
-	// Select all current spans in the batch to be sent
+	// Atomically take the current batch so the buffer is consumed exactly
+	// once: whatever is swapped out here is gone from the buffer, and
+	// anything appended afterwards is left for the next flush. This keeps
+	// the time-based and size-based flush triggers from re-taking or
+	// dropping spans without adding another lock around each take.
 	r.batchMtx.Lock()
-	sendBatch := r.batch[:]
+	sendBatch := r.batch
+	r.batch = nil
 	r.batchMtx.Unlock()
 
 	if len(sendBatch) == 0 {
@@ -175,11 +180,6 @@ func (r *httpReporter) sendBatch() error {
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		r.logger.Printf("failed the request with status code %d\n", resp.StatusCode)
 	}
-
-	// Remove sent spans from the batch even if they were not saved
-	r.batchMtx.Lock()
-	r.batch = r.batch[len(sendBatch):]
-	r.batchMtx.Unlock()
 
 	return nil
 }

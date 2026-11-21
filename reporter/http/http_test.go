@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -166,6 +167,74 @@ func TestSpanIsReportedAfterBatchSize(t *testing.T) {
 	aNumSpans = int(atomic.LoadInt64(&numSpans))
 	if aNumSpans != eNumSpans {
 		t.Errorf("unexpected number of spans received\nhave: %d, want: %d", aNumSpans, eNumSpans)
+	}
+}
+
+func TestConcurrentReporting(t *testing.T) {
+	serializer := reporter.JSONSerializer{}
+
+	var (
+		numSpans int64
+		dupSpans int64
+		seenIDs  sync.Map
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		aPayload, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+			return
+		}
+
+		var aSpans []*model.SpanModel
+		if err := json.Unmarshal(aPayload, &aSpans); err != nil {
+			t.Errorf("failed to parse json payload: %v", err)
+			return
+		}
+
+		for _, span := range aSpans {
+			if _, loaded := seenIDs.LoadOrStore(span.ID, struct{}{}); loaded {
+				atomic.AddInt64(&dupSpans, 1)
+			}
+		}
+		atomic.AddInt64(&numSpans, int64(len(aSpans)))
+	}))
+	defer ts.Close()
+
+	// Small batch size and batch interval so both the size-based and the
+	// time-based flush triggers fire concurrently while spans arrive.
+	rep := zipkinhttp.NewReporter(ts.URL,
+		zipkinhttp.Serializer(serializer),
+		zipkinhttp.BatchSize(7),
+		zipkinhttp.BatchInterval(5*time.Millisecond),
+	)
+
+	const (
+		producers        = 8
+		spansPerProducer = 50
+	)
+	eNumSpans := producers * spansPerProducer
+
+	var wg sync.WaitGroup
+	for p := 0; p < producers; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			spans := generateSpans(spansPerProducer)
+			for i, span := range spans {
+				span.ID = model.ID(p*spansPerProducer + i + 1)
+				rep.Send(*span)
+			}
+		}(p)
+	}
+	wg.Wait()
+	rep.Close()
+
+	if aNumSpans := int(atomic.LoadInt64(&numSpans)); aNumSpans != eNumSpans {
+		t.Errorf("unexpected number of spans received\nhave: %d, want: %d", aNumSpans, eNumSpans)
+	}
+	if aDupSpans := int(atomic.LoadInt64(&dupSpans)); aDupSpans != 0 {
+		t.Errorf("unexpected number of duplicate spans received\nhave: %d, want: 0", aDupSpans)
 	}
 }
 
